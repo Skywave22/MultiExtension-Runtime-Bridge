@@ -140,5 +140,10 @@ Two of these are worth calling out because they bound real workloads:
 - The JVM engine is only available when a JRE (or a worker providing the same
   protocol) is present; the daemon then pays that process's start-up once, on
   first use, not on every run.
+- The `js` engine's numbers are *its own process's* costs: a Node worker adds
+  tens of milliseconds at daemon startup and then answers over the same framed
+  protocol, so a JS-hosted source costs one extra hop rather than one extra
+  network round trip. The rule engine, which needs no worker at all, is the
+  path the numbers above measure.
 - The sandbox has two cores. On a larger machine throughput scales with cores;
   the *latency* figures are the ones that characterise the design.

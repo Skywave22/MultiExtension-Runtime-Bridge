@@ -16,16 +16,46 @@ bridge.methods {"prefix":"source."}   -> just the source surface
 | Namespace | Purpose |
 |---|---|
 | `bridge.*` | the daemon itself: handshake, liveness, metrics, introspection, logs, shutdown |
+| `engine.*` | the engines and the extensions they host: `engine.list`, `engine.load`, `engine.unload` |
 | `format.*` | the ten ecosystems: listing and artifact classification |
 | `repo.*` | extension repositories: list, add, remove, refresh |
 | `extension.*` | installed extensions: list, install, uninstall, info, update |
 | `source.*` | the unified content surface (below) |
 | `torrserver.*` | the TorrServer addon surface |
 
+## `engine.*`
+
+An engine that runs in its own process (the `js` worker, the `jvm` worker) can
+host extensions the daemon never sees as files. These three methods are how a
+host works with them; they follow the same call shape as everything else, so a
+host does not need a second API for "external" sources.
+
+| Method | Params | Returns |
+|---|---|---|
+| `engine.list` | — | `{engines:[{name, state, workers, workers_configured, jobs_ok, jobs_err, in_process, formats[]}]}` |
+| `engine.load` | `path`, `id?`, `engine?` | the worker's answer: `{id, name, version, methods}`. The source is registered, so `source.*` can address it immediately. |
+| `engine.unload` | `id`, `engine?` | `{removed: true}` |
+
+```sh
+# start a daemon with a JavaScript engine attached
+XBRIDGE_JS_WORKER="node /usr/share/xbridge/js_worker.js {}"   ./build/xbridged --endpoint unix:///tmp/x.sock
+```
+
+```python
+bridge.call("engine.load", {"id": "lnreader/example", "path": "/ext/example.js"})
+found = bridge.search("lnreader/example", "solo")     # served by the Node worker
+```
+
+`{}` in the worker command line is replaced with the worker index, so a pooled
+engine can give each worker its own scratch directory. An engine that cannot be
+started is reported as `unavailable` in the handshake and in `engine.list`; the
+rest of the bridge keeps working.
+
 ## `source.*`
 
 All of them take `source_id` — the installed extension id, e.g.
-`legado/book-source.json` or `aniyomi/en.animex` — and they all return JSON.
+`legado/book-source.json`, `aniyomi/en.animex` or `lnreader/example` for a
+source loaded into a worker engine — and they all return JSON.
 
 | Method | Extra params | Returns |
 |---|---|---|

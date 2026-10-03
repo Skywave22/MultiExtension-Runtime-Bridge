@@ -39,6 +39,14 @@ struct xb_listener {
     xb_sock_t   fd;
     xb_endpoint ep;
     volatile int stop;
+#ifndef _WIN32
+    /* Identity of the socket file we created. A restart that reuses the same
+     * path means a successor daemon may already have bound it; without this we
+     * would delete *its* socket while shutting down. */
+    dev_t  sock_dev;
+    ino_t  sock_ino;
+    bool   sock_ino_valid;
+#endif
 #ifdef _WIN32
     char        pipe_name[300];
     HANDLE      pipe;
@@ -212,6 +220,15 @@ xb_listener *xb_listen(const xb_endpoint *ep, int backlog, char *err, size_t err
             snprintf(err, errcap, "bind %s: %s", ep->path, strerror(errno));
             close(fd); xb_free(l); return NULL;
         }
+        if (ep->kind == XB_EP_UNIX) {
+            /* Record what we bound so close() can tell "ours" from "theirs". */
+            struct stat st;
+            if (stat(sa.sun_path, &st) == 0) {
+                l->sock_dev = st.st_dev;
+                l->sock_ino = st.st_ino;
+                l->sock_ino_valid = true;
+            }
+        }
         if (listen(fd, backlog) != 0) {
             snprintf(err, errcap, "listen: %s", strerror(errno));
             close(fd); xb_free(l); return NULL;
@@ -360,7 +377,18 @@ void xb_listener_close(xb_listener *l)
 #endif
     if (l->fd != XB_SOCK_INVALID) {
 #ifndef _WIN32
-        if (l->ep.kind == XB_EP_UNIX && l->ep.path[0]) unlink(l->ep.path);
+        if (l->ep.kind == XB_EP_UNIX && l->ep.path[0]) {
+            /* Unlink only the socket we created: a successor daemon may have
+             * rebound the same path already, and removing it would strand
+             * every client that has not connected yet. */
+            bool ours = true;
+            if (l->sock_ino_valid) {
+                struct stat st;
+                ours = stat(l->ep.path, &st) != 0 ||
+                       (st.st_dev == l->sock_dev && st.st_ino == l->sock_ino);
+            }
+            if (ours) unlink(l->ep.path);
+        }
 #endif
         XB_CLOSESOCK(l->fd);
     }

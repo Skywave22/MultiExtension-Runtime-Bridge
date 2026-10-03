@@ -105,7 +105,8 @@ core/src/                the daemon: framing, dispatch, cache, engines,
                          HTTP client, HTML parser, rule interpreter, registry
 core/formats/*.json      the format registry as data (generated, verified by tests)
 sdk/python/xbridge.py    Python client (+ Bridge.spawn lifecycle helper)
-sdk/node/xbridge.js      Node client, zero dependencies
+sdk/node/xbridge.js      Node client, zero dependencies (+ TypeScript types)
+core/workers/js_worker.js  the reference JavaScript engine worker (Node)
 tests/unit/              per-module suites (JSON, HTML, cache, util, registry, ABI)
 tests/protocol/          XBP/1 conformance over a real socket
 tests/e2e/run_e2e.py     the acceptance test: real daemon, real site, real rules
@@ -122,9 +123,10 @@ Every claim in this README is enforced by a test that runs on `make check`:
 
 | Suite | What it proves | Result on this tree |
 |---|---|---|
-| `tests/unit` | JSON, HTML, cache, hashing, ABI contracts | included below |
-| `tests/protocol` | framing, pipelining, concurrency, hostile clients | included below |
+| `tests/unit` | JSON, HTML, cache, hashing, ABI contracts | 70 tests, 2 686 checks |
+| `tests/protocol` | framing, pipelining, concurrency, hostile clients | included above |
 | `tests/e2e` | install → search → detail → chapter over real HTTP | 84/84 checks |
+| `tests/e2e/js_engine.py` | a **second engine**: Node worker hosting a source | 24/24 checks |
 | `sdk/python/test_smoke.py` | the Python client, from spawn to retry | 17/17 checks |
 | `sdk/node/test/smoke.js` | the Node client, same journey | 27/27 checks |
 
@@ -139,14 +141,24 @@ PASS (no leaks)
 
 $ make e2e
 e2e: 84/84 checks passed, 0 failed
+
+$ make js-test       # a real Node worker hosting a real source
+js engine: 24 passed, 0 failed
+
+$ make node-test && make python-test
+node sdk: 27 passed, 0 failed
+python sdk: 17 passed, 0 failed
 ```
+
+`make check` runs the unit, protocol, end-to-end, js-engine and Node suites.
 
 The suites found real bugs during development and they are recorded in the
 commit log: a vanished client could kill the daemon with `SIGPIPE`; every
 thread was spawned detached so shutdown raced with in-flight work; the HTML
 selector parser dropped `.class`/`[attr]` suffixes after a tag name; URL joins
-produced double slashes; and the Python client unlinked the daemon's socket
-when a plain client closed. Each has a regression test now.
+produced double slashes; the Python client unlinked the daemon's socket when a
+plain client closed; and a restarting daemon would delete its successor's
+socket. Each has a regression test now.
 
 ## Platforms
 
@@ -159,7 +171,7 @@ The core is plain C11 + libc. Transports, engines and builds adapt per OS:
 | In-process ABI (`abi.h`) | ✅ | ✅ | ✅ | ✅ NDK | ✅ static lib |
 | Built-in rule engine | ✅ | ✅ | ✅ | ✅ | ✅ |
 | JVM extensions | external JRE | external JRE | external JRE | `XBRIDGE_JVM_WORKER` | — |
-| JS extensions | `XBRIDGE_JS_WORKER` | same | same | same | same |
+| JS extensions | `core/workers/js_worker.js` (Node) | same | same | same | same |
 
 Anything that needs a runtime Xbridge does not embed is attached through
 worker processes, so the bridge never becomes a hard dependency on Node or a

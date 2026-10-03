@@ -4,8 +4,8 @@
 
 ```
                     ┌──────────────────────────── host application ────────────────────────────┐
-                    │  Python SDK      Node SDK      Dart/Flutter      Kotlin/Swift/C#         │
-                    └───────┬─────────────┬──────────────┬───────────────────┬────────────────┘
+                    │  Python SDK      Node SDK      (Dart/Swift: bind to the C ABI)           │
+                    └───────┬─────────────┬────────────────────────────────┬─────────────────┘
                             │             │              │                   │
                 XBP/1 over UDS / abstract UDS / named pipe / TCP      in-process C ABI
                             │             │              │                   │
@@ -22,6 +22,8 @@
                     │ (Node/Bun/  │       │ (JRE + our   │       │ (contributions  │
                     │  Deno/qjs)  │       │  worker jar) │       │  speak XBP/1)   │
                     └─────────────┘       └──────────────┘       └─────────────────┘
+                       shipped:              external:              anything:
+                       core/workers/         XBRIDGE_JVM_WORKER     XBRIDGE_*_WORKER
 ```
 
 One protocol, three relationships: host↔daemon, daemon↔engine, and (in-process)
@@ -42,6 +44,9 @@ is actually loaded:
   when it is not. A host that only uses rules never pays for either.
 - On iOS, where a second process is not an option, the same dispatcher is
   reachable through the C ABI (`core/include/bridge/abi.h`) instead of a socket.
+  A Dart FFI binding and a Swift wrapper are thin translations of that header,
+  which is why the ABI — not a language SDK — is the interface that matters for
+  embedded hosts.
 
 ## Subsystems
 
@@ -59,6 +64,27 @@ is actually loaded:
 | `core/src/archive.c` | artifact detection by content, not extension: zip listing, markers, confidence + evidence | `format.detect` returns the evidence string, so a misdetection is debuggable. |
 | `core/src/proc.c`, `core/src/net.c`, `core/src/util.c`, `core/src/log.c`, `core/src/buf.c` | process spawning, four transports behind one socket-shaped API, portable threads/time/hashing/strings, structured logging, buffers | These are the only files that need `#ifdef _WIN32`, which is deliberate: platform variance is contained. |
 | `core/src/abi.c` | the embedding ABI | Same handlers, same error table, no socket. |
+| `core/workers/js_worker.js` | the reference JavaScript engine worker | A Node process that speaks XBP/1 on stdio and hosts CommonJS source modules. Written in JS because that is the language the ecosystems it serves are written in, and it is the model for any other worker. |
+
+## How an engine gets attached
+
+```
+XBRIDGE_JS_WORKER="node /usr/share/xbridge/js_worker.js {}"  ./build/xbridged
+                                  │
+                                  ├─ split on whitespace, honouring quotes → argv
+                                  ├─ spawn one process per configured worker
+                                  └─ HELLO / HELLO_ACK over its stdio
+```
+
+The daemon then treats that worker exactly like a client: it writes `REQUEST`
+frames and reads `RESPONSE`/`STREAM_*` frames. Anything that speaks XBP/1 can be
+an engine — a Bun process, a JVM, a Rust helper — which is why "support every
+ecosystem" does not mean "embed every runtime".
+
+`engine.load`/`engine.unload` forward to a worker and register the source in the
+daemon's extension table, so the unified `source.*` surface addresses
+worker-hosted sources with the same call as a built-in rule file. If a worker
+refuses the extension, the install fails at that point rather than at first use.
 
 ## Data flow of one request
 

@@ -248,6 +248,9 @@ typedef struct {
     char kind[16];
     int64_t installed_ms;
     int64_t size;
+    /** "" for a daemon-local extension; the engine name ("js", "jvm") when the
+     *  code actually lives in a worker process. */
+    char hosted_by[16];
 } ext_entry;
 
 struct xb_bridge {
@@ -514,6 +517,44 @@ static void state_load(xb_bridge *b)
 
 /* ------------------------------------------------------------- lifecycle -- */
 
+/* Split a command line on whitespace, honouring double quotes:
+ *   node "/opt/my worker.js" {}
+ * Returns the argument count (0 when `cmd` is NULL/empty/short). */
+static int split_command_line(const char *cmd, char *argv[], size_t cap)
+{
+    if (!cmd || !cmd[0]) return 0;
+    int n = 0;
+    char token[1024];
+    size_t tl = 0;
+    bool in_quotes = false;
+    for (const char *p = cmd; ; p++) {
+        char c = *p;
+        if (c == '"') { in_quotes = !in_quotes; continue; }
+        if ((c == '\0' && tl == 0) || (!in_quotes && (c == ' ' || c == '\t' || c == '\0'))) {
+            if (tl > 0) {
+                if ((size_t)n >= cap - 1) break;
+                token[tl] = '\0';
+                argv[n++] = xb_strdup(token);
+                tl = 0;
+            }
+            if (c == '\0') break;
+            continue;
+        }
+        if (tl < sizeof token - 1) token[tl++] = c;
+    }
+    argv[n] = NULL;
+    if (n == 0) return 0;
+    /* A bare command name is resolved through PATH by the engine, which is the
+     * behaviour a caller expects from an environment variable named *_WORKER. */
+    return n;
+}
+
+static void free_argv(char *argv[])
+{
+    for (int i = 0; argv[i]; i++) xb_free(argv[i]);
+    argv[0] = NULL;
+}
+
 xb_bridge *xb_bridge_new(const xb_config *cfg)
 {
     xb_bridge *b = (xb_bridge *)xb_alloc(sizeof *b);
@@ -547,13 +588,17 @@ int xb_bridge_init(xb_bridge *b, char *err, size_t errcap)
     }
 
     /* Optional engines: attach to whatever runtime is present. The environment
-     * variables let a host point at a specific binary (bundled Node, a JRE). */
+     * variables describe the *command line*, so a worker that needs arguments
+     * works without a wrapper script:
+     *   XBRIDGE_JS_WORKER="node /usr/share/xbridge/js_worker.js {}"
+     * A `{}` is replaced with the worker index, which is how a pooled engine
+     * can give each worker its own scratch directory. */
     if (b->engine_count < XB_MAX_ENGINES) {
-        const char *js_cmd = getenv("XBRIDGE_JS_WORKER");
-        if (js_cmd && js_cmd[0]) {
-            const char *argv[] = { js_cmd, NULL };
-            xb_engine *e = xb_engine_new("js", argv, b->cfg.workers_per_engine,
-                                         8000, 250);
+        char *argv[32];
+        if (split_command_line(getenv("XBRIDGE_JS_WORKER"), argv, XB_ARRAY_LEN(argv)) > 0) {
+            xb_engine *e = xb_engine_new("js", (const char *const *)argv,
+                                         b->cfg.workers_per_engine, 8000, 250);
+            free_argv(argv);
             if (e) {
                 xb_engine_start(e, false, err, errcap);
                 b->engines[b->engine_count++] = e;
@@ -561,11 +606,11 @@ int xb_bridge_init(xb_bridge *b, char *err, size_t errcap)
         }
     }
     if (b->engine_count < XB_MAX_ENGINES) {
-        const char *jvm_cmd = getenv("XBRIDGE_JVM_WORKER");
-        if (jvm_cmd && jvm_cmd[0]) {
-            const char *argv[] = { jvm_cmd, NULL };
-            xb_engine *e = xb_engine_new("jvm", argv, b->cfg.workers_per_engine,
-                                         20000, 500);
+        char *argv[32];
+        if (split_command_line(getenv("XBRIDGE_JVM_WORKER"), argv, XB_ARRAY_LEN(argv)) > 0) {
+            xb_engine *e = xb_engine_new("jvm", (const char *const *)argv,
+                                         b->cfg.workers_per_engine, 20000, 500);
+            free_argv(argv);
             if (e) {
                 xb_engine_start(e, false, err, errcap);
                 b->engines[b->engine_count++] = e;
@@ -846,7 +891,53 @@ static int install_path(xb_bridge *b, const char *path, const char *manager_hint
         XB_INFO("installed rule source %s (%d rule(s))", x->id, n);
     }
 
+    /* Worker-hosted sources (js, jvm) are registered here and loaded into the
+     * worker; a failure to load fails the install, for the same reason rule
+     * files do: a source that cannot work should not appear to be installed. */
     b->ext_count++;
+    if (fmt && !xb_streq(fmt->engine, "rule") && !xb_streq(fmt->engine, "native")) {
+        xb_engine *eng = xb_bridge_engine(b, fmt->engine);
+        if (eng && xb_engine_state_of(eng) != XB_ENGINE_UNAVAILABLE) {
+            xb_jsonw pw;
+            xb_jw_init(&pw);
+            xb_jw_obj_begin(&pw);
+            xb_jw_kv_str(&pw, "id", x->id);
+            xb_jw_kv_str(&pw, "path", final_path);
+            xb_jw_obj_end(&pw);
+            char *pjson = xb_buf_steal(&pw.buf);
+            xb_jw_free(&pw);
+
+            xb_arena pa;
+            xb_arena_init(&pa);
+            size_t poff = 0;
+            xb_json *parsed = xb_json_parse(&pa, pjson, strlen(pjson), &poff);
+
+            xb_job job;
+            memset(&job, 0, sizeof job);
+            job.method = "engine.load";
+            job.params = parsed;
+            xb_job_result jr;
+            int rc = xb_engine_submit(eng, &job, &jr);
+            xb_free(jr.result);
+            xb_free(jr.error_msg);
+            xb_arena_destroy(&pa);
+            xb_free(pjson);
+
+            if (rc != 0) {
+                snprintf(err, errcap, "engine '%s' refused %.150s", fmt->engine, path);
+                memset(x, 0, sizeof *x);
+                b->ext_count--;
+                return -1;
+            }
+            xb_str_lcpy(x->hosted_by, fmt->engine, sizeof x->hosted_by);
+            XB_INFO("loaded %s into the %s engine", x->id, fmt->engine);
+        } else {
+            /* The engine is unavailable: keep the record, mark it, and answer
+             * 'unavailable' rather than 'not found' on use. */
+            xb_str_lcpy(x->hosted_by, fmt->engine, sizeof x->hosted_by);
+            XB_WARN("installed %s but the %s engine is unavailable", x->id, fmt->engine);
+        }
+    }
     if (out) *out = *x;
     state_save(b);
     return 0;
@@ -1238,6 +1329,153 @@ static int h_bridge_metrics(xb_ctx *ctx)
 
     xb_jw_obj_end(ctx->out);
     return 0;
+}
+
+/* ------------------------------------------------------------- engines ---- */
+
+/* Engines that run in a separate process (js, jvm) can host extensions the
+ * daemon knows nothing about. These three methods are the bridge to that:
+ * they forward to the worker, which answers in its own vocabulary, so a host
+ * can load, list and unload worker-hosted extensions with the same call shape
+ * it uses for the built-in rule engine. */
+
+static xb_engine *pick_engine(xb_bridge *b, const xb_json *params)
+{
+    const char *want = xb_json_obj_str(params, "engine", NULL);
+    xb_engine *e = NULL;
+    if (want && want[0]) {
+        e = xb_bridge_engine(b, want);
+        if (!e) return NULL;
+        if (xb_engine_state_of(e) == XB_ENGINE_UNAVAILABLE) return NULL;
+        return e;
+    }
+    /* No engine named: use the only live non-rule engine, which is the common
+     * case for a host that configured exactly one worker kind. */
+    static const char *CANDIDATES[] = { "js", "jvm", NULL };
+    for (size_t i = 0; CANDIDATES[i]; i++) {
+        xb_engine *c = xb_bridge_engine(b, CANDIDATES[i]);
+        if (c && xb_engine_state_of(c) != XB_ENGINE_UNAVAILABLE) return c;
+    }
+    return NULL;
+}
+
+static int forward_to_engine(xb_ctx *ctx, const char *method)
+{
+    xb_engine *e = pick_engine(ctx->bridge, ctx->params);
+    if (!e) {
+        xb_jw_obj_begin(ctx->out);
+        xb_jw_kv_bool(ctx->out, "available", false);
+        xb_jw_kv_str(ctx->out, "reason",
+                     "no worker-hosted engine is configured or available");
+        xb_jw_obj_end(ctx->out);
+        return 0;   /* a host asks, and gets an answer, rather than an error */
+    }
+
+    xb_job job;
+    memset(&job, 0, sizeof job);
+    job.method = method;
+    job.params = ctx->params;
+    job.deadline_ms = ctx->deadline_ms ? ctx->deadline_ms - xb_mono_ms() : 0;
+    xb_job_result jr;
+    int rc = xb_engine_submit(e, &job, &jr);
+    if (rc != 0) {
+        xb_free(jr.result);
+        xb_free(jr.error_msg);
+        return jr.error_code ? jr.error_code : XB_ERR_ENGINE;
+    }
+    if (jr.result) xb_jw_raw(ctx->out, jr.result);
+    else xb_jw_null(ctx->out);
+    xb_free(jr.result);
+    xb_free(jr.error_msg);
+    return 0;
+}
+
+static int h_engine_list(xb_ctx *ctx)
+{
+    /* This is the one place that walks the bridge's engine table directly:
+     * engine.list is a view of the daemon's own configuration, not of any
+     * single engine's state. */
+    xb_jw_obj_begin(ctx->out);
+    xb_jw_key(ctx->out, "engines");
+    xb_jw_arr_begin(ctx->out);
+    for (size_t i = 0; i < ctx->bridge->engine_count; i++) {
+        xb_engine *e = ctx->bridge->engines[i];
+        xb_engine_stats es;
+        xb_engine_stats_of(e, &es);
+        xb_jw_obj_begin(ctx->out);
+        xb_jw_kv_str(ctx->out, "name", xb_engine_name(e));
+        xb_jw_kv_str(ctx->out, "state", xb_engine_state_name(xb_engine_state_of(e)));
+        xb_jw_kv_int(ctx->out, "workers", es.live_workers);
+        xb_jw_kv_int(ctx->out, "workers_configured", es.total_workers);
+        xb_jw_kv_int(ctx->out, "jobs_ok", es.jobs_ok);
+        xb_jw_kv_int(ctx->out, "jobs_err", es.jobs_err);
+        xb_jw_kv_bool(ctx->out, "in_process",
+                      xb_engine_state_of(e) != XB_ENGINE_UNAVAILABLE &&
+                      es.total_workers == 1 && xb_engine_name(e)[0] == 'r');
+        xb_jw_key(ctx->out, "formats");
+        xb_jw_arr_begin(ctx->out);
+        for (size_t f = 0; f < xb_format_count(); f++) {
+            const xb_format *fmt = xb_format_at(f);
+            if (xb_strieq(fmt->engine, xb_engine_name(e))) xb_jw_str(ctx->out, fmt->id);
+        }
+        xb_jw_arr_end(ctx->out);
+        xb_jw_obj_end(ctx->out);
+    }
+    xb_jw_arr_end(ctx->out);
+    xb_jw_obj_end(ctx->out);
+    return 0;
+}
+
+static int h_engine_load(xb_ctx *ctx)
+{
+    const char *path = xb_json_obj_str(ctx->params, "path", NULL);
+    const char *want_id = xb_json_obj_str(ctx->params, "id", NULL);
+    if (!path) {
+        xb_jw_obj_begin(ctx->out);
+        xb_jw_kv_str(ctx->out, "error", "engine.load needs a 'path'");
+        xb_jw_obj_end(ctx->out);
+        return XB_ERR_PARAMS;
+    }
+    xb_engine *e = pick_engine(ctx->bridge, ctx->params);
+    if (e) {
+        xb_detect_result det;
+        xb_detect_path(path, &det);
+        const char *manager = det.manager_id[0] ? det.manager_id : xb_engine_name(e);
+        /* Register the source so `source.*` can route to it: the daemon routes
+         * by extension id, and a worker-hosted extension is still an extension. */
+        if (ctx->bridge->ext_count < XB_MAX_EXTENSIONS) {
+            ext_entry *x = &ctx->bridge->exts[ctx->bridge->ext_count];
+            memset(x, 0, sizeof *x);
+            if (want_id && want_id[0]) {
+                xb_str_lcpy(x->id, want_id, sizeof x->id);
+            } else {
+                char base[256];
+                const char *leaf = strrchr(path, XB_PATHSEP);
+                xb_str_lcpy(base, leaf ? leaf + 1 : path, sizeof base);
+                char *dot = strrchr(base, '.');
+                if (dot) *dot = '\0';
+                char idbuf[320];
+                snprintf(idbuf, sizeof idbuf, "%s/%s", manager, base);
+                xb_str_lcpy(x->id, idbuf, sizeof x->id);
+            }
+            xb_str_lcpy(x->name, x->id, sizeof x->name);
+            xb_str_lcpy(x->version, "unknown", sizeof x->version);
+            xb_str_lcpy(x->manager_id, manager, sizeof x->manager_id);
+            xb_str_lcpy(x->format_id, manager, sizeof x->format_id);
+            xb_str_lcpy(x->path, path, sizeof x->path);
+            xb_str_lcpy(x->kind, "script", sizeof x->kind);
+            xb_str_lcpy(x->hosted_by, xb_engine_name(e), sizeof x->hosted_by);
+            x->installed_ms = xb_now_ms();
+            ctx->bridge->ext_count++;
+            state_save(ctx->bridge);
+        }
+    }
+    return forward_to_engine(ctx, "engine.load");
+}
+
+static int h_engine_unload(xb_ctx *ctx)
+{
+    return forward_to_engine(ctx, "engine.unload");
 }
 
 /* Method introspection: what this daemon can do, and where each method is
@@ -1694,6 +1932,9 @@ int xb_register_builtin_methods(void)
     REG("bridge.ping",      h_bridge_ping,      "", false, false, "liveness");
     REG("bridge.metrics",   h_bridge_metrics,   "", false, false, "counters and cache stats");
     REG("bridge.methods",   h_bridge_methods,   "", false, false, "method introspection");
+    REG("engine.list",      h_engine_list,      "", false, false, "available engines");
+    REG("engine.load",      h_engine_load,      "", false, false, "load an extension into a worker engine");
+    REG("engine.unload",    h_engine_unload,    "", false, false, "unload a worker-hosted extension");
     REG("bridge.log",       h_bridge_log,       "", false, false, "recent log lines");
     REG("bridge.shutdown",  h_bridge_shutdown,  "", false, false, "graceful stop");
 

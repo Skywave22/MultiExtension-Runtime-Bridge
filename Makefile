@@ -3,6 +3,7 @@
 #   make            build the daemon (build/xbridged)
 #   make test       build and run the unit + protocol suite
 #   make e2e        run the end-to-end test (real daemon, real HTTP site)
+#   make js-test    run the js-engine test (real daemon + Node worker)
 #   make check      test + e2e
 #   make bench      build and run the benchmark
 #   make formats    regenerate the JSON mirror of the format table
@@ -43,7 +44,7 @@ endif
 CFLAGS  += $(CSTD) $(OPT) $(WARN) $(DEFS) $(INC) $(SAN_FLAGS) -MMD -MP -fPIC
 LDFLAGS += $(SAN_FLAGS)
 
-.PHONY: all clean test bench asan check formats e2e node-test python-test
+.PHONY: all clean test bench asan check formats e2e js-test node-test python-test
 
 all: $(BIN)
 
@@ -92,6 +93,11 @@ clean:
 e2e: all
 	python3 tests/e2e/run_e2e.py
 
+# Proves the worker-hosted engine path with a real Node process.
+js-test: all
+	@command -v node >/dev/null 2>&1 || { echo "node not installed; skipping"; exit 0; }
+	python3 tests/e2e/js_engine.py
+
 # SDK conformance: each client library must drive a real daemon end to end.
 node-test: all
 	@command -v node >/dev/null 2>&1 || { echo "node not installed; skipping"; exit 0; }
@@ -100,7 +106,7 @@ node-test: all
 python-test: all
 	python3 sdk/python/test_smoke.py
 
-check: all test e2e node-test
+check: all test e2e js-test node-test
 
 -include $(CORE_OBJ:.o=.d)
 -include $(TEST_OBJ:.o=.d)

@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.cc }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+          - os: ubuntu-latest
+            cc: clang
+          - os: macos-latest
+            cc: clang
+          - os: windows-latest
+            cc: cl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (POSIX)
+        if: matrix.os != 'windows-latest'
+        env:
+          CC: ${{ matrix.cc }}
+        run: make -j4
+
+      - name: Unit + protocol tests (POSIX)
+        if: matrix.os != 'windows-latest'
+        env:
+          CC: ${{ matrix.cc }}
+        run: make test
+
+      - name: Sanitizers (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          CC: ${{ matrix.cc }}
+        run: make asan
+
+      - name: End-to-end test (POSIX)
+        if: matrix.os != 'windows-latest'
+        env:
+          CC: ${{ matrix.cc }}
+        run: make e2e
+
+      - name: Python SDK smoke test (POSIX)
+        if: matrix.os != 'windows-latest'
+        run: make python-test
+
+      - name: Node SDK smoke test
+        env:
+          CC: ${{ matrix.cc }}
+        run: |
+          npm --version
+          node --version
+          node sdk/node/test/smoke.js
+
+      - name: Micro-benchmarks (POSIX)
+        if: matrix.os != 'windows-latest'
+        run: make bench
+
+      - name: Daemon benchmark (POSIX)
+        if: matrix.os != 'windows-latest'
+        run: python3 tools/bench_daemon.py

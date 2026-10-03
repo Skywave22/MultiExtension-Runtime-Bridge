@@ -46,7 +46,7 @@ xb_artifact_kind xb_artifact_sniff_magic(const void *data, size_t len)
          (p[2] == 7 && p[3] == 8)))
         return XB_ART_ZIP;
     if (len >= 2 && p[0] == 0x1F && p[1] == 0x8B) return XB_ART_TAR_GZ;
-    if (len >= 9 && memcmp(p, "\x89PNG\r\n\x1a\n", 8) == 0) return XB_ART_BINARY;
+    if (len >= 8 && memcmp(p, "\x89PNG\r\n\x1a\n", 8) == 0) return XB_ART_BINARY;
     if (len >= 4 && p[0] == 0x7F && p[1] == 'E' && p[2] == 'L' && p[3] == 'F')
         return XB_ART_BINARY;
     if (len >= 2 && p[0] == 'M' && p[1] == 'Z') return XB_ART_BINARY;

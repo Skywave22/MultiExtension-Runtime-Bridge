@@ -123,7 +123,7 @@ Every claim in this README is enforced by a test that runs on `make check`:
 
 | Suite | What it proves | Result on this tree |
 |---|---|---|
-| `tests/unit` | JSON, HTML, cache, single-flight, hashing, sockets, ABI | 80 tests, 2 784 checks |
+| `tests/unit` | JSON, HTML, cache, single-flight, hashing, sockets, artifacts, ABI | 85 tests, 2 878 checks |
 | `tests/protocol` | framing, pipelining, concurrency, cancellation, hostile clients | included above |
 | `tests/e2e` | install → search → detail → chapter over real HTTP | 84/84 checks |
 | `tests/e2e/js_engine.py` | a **second engine**: Node worker hosting a source, deadlines, cancel | 43/43 checks |
@@ -132,11 +132,11 @@ Every claim in this README is enforced by a test that runs on `make check`:
 
 ```sh
 $ make test
-80 tests, 2784 checks, 0 failures
+85 tests, 2878 checks, 0 failures
 PASS (no leaks)
 
 $ make asan          # AddressSanitizer + UndefinedBehaviorSanitizer
-80 tests, 2784 checks, 0 failures
+85 tests, 2878 checks, 0 failures
 PASS (no leaks)
 
 $ make e2e
@@ -164,8 +164,9 @@ the engine job they named, so cancellation only looked implemented; the
 shutdown wake-up connection could be lost and leave the daemon hanging in
 `accept()`; a coalesced waiter was told `-32000` whatever the real reason was;
 the Node client could deadlock when responses arrived out of order; and the
-POSIX wake-up pair handed back the read end first, so it never signalled. Each
-has a regression test now.
+POSIX wake-up pair handed back the read end first, so it never signalled; and
+the archive sniffer demanded nine bytes for an eight-byte PNG signature, so a
+PNG was not classified as a native binary. Each has a regression test now.
 
 ## Platforms
 

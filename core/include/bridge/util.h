@@ -29,6 +29,8 @@ void  xb_free(void *p);
 char *xb_strdup(const char *s);
 char *xb_strndup(const char *s, size_t n);
 size_t xb_total_allocated(void);     /* live bytes, for metrics/leak tests */
+size_t xb_rss_bytes(void);           /* resident set size, 0 when unknown */
+size_t xb_peak_rss_bytes(void);      /* high-water mark, 0 when unknown */
 size_t xb_total_blocks(void);        /* live allocation count */
 
 #ifdef XB_ALLOC_TRACK

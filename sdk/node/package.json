@@ -1,0 +1,14 @@
+{
+  "name": "xbridge",
+  "version": "1.0.0",
+  "description": "XBP/1 client for the Xbridge multi-extension runtime bridge",
+  "main": "xbridge.js",
+  "types": "xbridge.d.ts",
+  "files": ["xbridge.js", "xbridge.d.ts", "README.md"],
+  "engines": { "node": ">=16" },
+  "scripts": {
+    "test": "node test/smoke.js"
+  },
+  "keywords": ["xbridge", "xbp", "anymeX", "legado", "aniyomi", "cloudstream", "extensions"],
+  "license": "GPL-3.0"
+}

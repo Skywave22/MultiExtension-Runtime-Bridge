@@ -22,6 +22,7 @@ typedef struct {
 } xb_method_meta;
 
 int  xb_register_method_meta(const xb_method_meta *meta);
+void xb_method_registry_free(void);
 bool xb_lookup_method_meta(const char *name, xb_method_meta *out);
 
 /* Bridge state accessors used by the server. */

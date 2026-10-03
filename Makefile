@@ -43,7 +43,7 @@ endif
 CFLAGS  += $(CSTD) $(OPT) $(WARN) $(DEFS) $(INC) $(SAN_FLAGS) -MMD -MP -fPIC
 LDFLAGS += $(SAN_FLAGS)
 
-.PHONY: all clean test bench asan check formats e2e
+.PHONY: all clean test bench asan check formats e2e node-test python-test
 
 all: $(BIN)
 
@@ -92,7 +92,15 @@ clean:
 e2e: all
 	python3 tests/e2e/run_e2e.py
 
-check: all test e2e
+# SDK conformance: each client library must drive a real daemon end to end.
+node-test: all
+	@command -v node >/dev/null 2>&1 || { echo "node not installed; skipping"; exit 0; }
+	node sdk/node/test/smoke.js
+
+python-test: all
+	python3 sdk/python/test_smoke.py
+
+check: all test e2e node-test
 
 -include $(CORE_OBJ:.o=.d)
 -include $(TEST_OBJ:.o=.d)

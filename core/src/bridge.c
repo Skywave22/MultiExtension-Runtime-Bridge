@@ -162,6 +162,24 @@ int xb_register_method(const char *name, xb_handler_fn fn)
     return 0;
 }
 
+/* Release the registry's own allocations. The registry is process-global, so
+ * this exists for hosts that embed the library and then want a clean leak
+ * report (test runners, hot-reloading shells) rather than for the daemon. */
+void xb_method_registry_free(void)
+{
+    mr_init();
+    XB_MUTEX_LOCK(&MR.m);
+    for (size_t i = 0; i < MR.n; i++) {
+        /* Only `name` is copied on registration; `engine` and `summary` point
+         * at string literals owned by the caller. */
+        xb_free((void *)MR.entries[i].name);
+    }
+    memset(MR.entries, 0, sizeof MR.entries);
+    memset(MR.handlers, 0, sizeof MR.handlers);
+    MR.n = 0;
+    XB_MUTEX_UNLOCK(&MR.m);
+}
+
 xb_handler_fn xb_lookup_method(const char *name)
 {
     mr_init();
@@ -1213,9 +1231,45 @@ static int h_bridge_metrics(xb_ctx *ctx)
     xb_jw_key(ctx->out, "memory");
     xb_jw_obj_begin(ctx->out);
     xb_jw_kv_int(ctx->out, "allocated_bytes", (int64_t)xb_total_allocated());
+    xb_jw_kv_int(ctx->out, "allocated_blocks", (int64_t)xb_total_blocks());
+    xb_jw_kv_int(ctx->out, "rss_bytes", (int64_t)xb_rss_bytes());
+    xb_jw_kv_int(ctx->out, "peak_rss_bytes", (int64_t)xb_peak_rss_bytes());
     xb_jw_obj_end(ctx->out);
 
     xb_jw_obj_end(ctx->out);
+    return 0;
+}
+
+/* Method introspection: what this daemon can do, and where each method is
+ * served from. Hosts use it to build a capability screen and to decide whether
+ * to offer a feature without probing it first. */
+static int h_bridge_methods(xb_ctx *ctx)
+{
+    char *list = xb_method_list_json();
+    const char *prefix = xb_json_obj_str(ctx->params, "prefix", NULL);
+    xb_arena a;
+    xb_arena_init(&a);
+    size_t off = 0;
+    xb_json *arr = xb_json_parse(&a, list, strlen(list), &off);
+
+    xb_jw_obj_begin(ctx->out);
+    xb_jw_kv_int(ctx->out, "count", (int64_t)xb_method_count());
+    xb_jw_key(ctx->out, "methods");
+    if (arr) {
+        xb_jw_arr_begin(ctx->out);
+        for (size_t i = 0; i < (size_t)xb_json_arr_len(arr); i++) {
+            const xb_json *m = xb_json_arr_at(arr, (int)i);
+            const char *name = xb_json_obj_str(m, "name", "");
+            if (prefix && prefix[0] && strncmp(name, prefix, strlen(prefix)) != 0) continue;
+            xb_jw_value(ctx->out, m);
+        }
+        xb_jw_arr_end(ctx->out);
+    } else {
+        xb_jw_raw(ctx->out, "[]");
+    }
+    xb_jw_obj_end(ctx->out);
+    xb_arena_destroy(&a);
+    xb_free(list);
     return 0;
 }
 
@@ -1639,6 +1693,7 @@ int xb_register_builtin_methods(void)
     REG("bridge.handshake", h_bridge_handshake, "", false, false, "capabilities");
     REG("bridge.ping",      h_bridge_ping,      "", false, false, "liveness");
     REG("bridge.metrics",   h_bridge_metrics,   "", false, false, "counters and cache stats");
+    REG("bridge.methods",   h_bridge_methods,   "", false, false, "method introspection");
     REG("bridge.log",       h_bridge_log,       "", false, false, "recent log lines");
     REG("bridge.shutdown",  h_bridge_shutdown,  "", false, false, "graceful stop");
 

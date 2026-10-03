@@ -17,7 +17,7 @@ stop work; *(4)* streaming that cannot be silently dropped; *(5)* cheap to parse
 | Named pipe | Windows | `npipe://\\.\pipe\xbridge-<user>` |
 | TCP loopback | everywhere, fallback / remote debugging | `tcp://127.0.0.1:0` (port printed on stdout) |
 | stdio | engine workers, embedding | `stdio://` |
-| Shared library ABI | iOS / Android in-process | see `core/include/bridge/abi.h` (planned) |
+| Shared library ABI | iOS / Android in-process | `core/include/bridge/abi.h` — same dispatcher, same error table, no socket |
 
 The daemon prints exactly one JSON line to stdout when it is ready:
 
@@ -49,7 +49,7 @@ Every message on a byte stream is:
 | Code | Name | Direction | Payload |
 |---|---|---|---|
 | `0x01` | `HELLO` | both | `{"protocol":"XBP/1","client":"node-sdk/1.0.0","max_frame":16777216,"features":["stream","cancel"]}` |
-| `0x02` | `HELLO_ACK` | daemon | `{"protocol":"XBP/1","version":"1.0.0","limits":{...},"features":[...],"engines":[{"name":"js","status":"ready","formats":[...]}]}` |
+| `0x02` | `HELLO_ACK` | daemon | `{"protocol":"XBP/1","software":"xbridged/1.0.0","protocol_version":1,"pid":N,"started_ms":T,"max_frame":16777216,"task_threads":16,"cache_entries":4096,"cache_ttl_ms":60000,"endpoint":"unix://…","data_dir":"…","features":[…],"capabilities":{"tls":true,"tls_backend":"curl","formats":10,"methods":30,"installed_extensions":0,"repositories":0,"allow_shutdown":false},"engines":[{"name":"rule","status":"ready","workers":1,"workers_configured":1,"formats":["legado"]}]}` — `pid` and `started_ms` let a supervisor detect a replacement process, and `capabilities.formats`/`methods` let a host build a UI without probing |
 | `0x03` | `REQUEST` | both | see §3 |
 | `0x04` | `RESPONSE` | daemon | see §4 |
 | `0x05` | `STREAM_CHUNK` | daemon | see §5 |

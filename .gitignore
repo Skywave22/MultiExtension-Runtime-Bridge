@@ -13,6 +13,10 @@ state.json
 data/
 *.sock
 
+# Python bytecode caches
+__pycache__/
+*.pyc
+
 # Editor/OS noise
 .DS_Store
 *.swp

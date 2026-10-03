@@ -19,6 +19,14 @@ void xb_test_register(const char *name, xb_test_fn fn, const char *suite)
     xb_test_count++;
 }
 
+static void (*g_atexit_hooks[16])(void);
+static int g_atexit_count;
+
+void xb_test_atexit(void (*fn)(void))
+{
+    if (fn && g_atexit_count < 16) g_atexit_hooks[g_atexit_count++] = fn;
+}
+
 int xb_test_run_all(void)
 {
     int failed_tests = 0;
@@ -50,6 +58,8 @@ int xb_test_run_all(void)
         }
     }
     if (failed_suites) printf("  -> suite %s: FAILED\n", current_suite);
+
+    for (int i = 0; i < g_atexit_count; i++) g_atexit_hooks[i]();
 
     printf("\n%u tests, %u checks, %u failures\n",
            (unsigned)xb_test_count, (unsigned)xb_test_checks, (unsigned)failed_tests);

@@ -33,6 +33,9 @@ extern const char *xb_current;
 extern const char *xb_suite;
 
 void xb_test_register(const char *name, xb_test_fn fn, const char *suite);
+/* Register a teardown hook; hooks run after the last test and before the
+ * leak check, which is where a suite releases process-global state. */
+void xb_test_atexit(void (*fn)(void));
 int  xb_test_run_all(void);
 
 #ifdef _WIN32

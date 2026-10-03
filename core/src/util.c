@@ -14,6 +14,7 @@
 #else
 #  include <unistd.h>
 #  include <sys/time.h>
+#  include <sys/resource.h>
 #endif
 
 /* ---------------------------------------------------------------- memory -- */
@@ -175,6 +176,54 @@ char *xb_strdup(const char *s)
 size_t xb_total_blocks(void)
 {
     return (size_t)g_live_blocks;
+}
+
+/* Resident set size, best effort. A daemon that reports its own footprint is
+ * easier to operate, and the number is only ever advisory. */
+size_t xb_rss_bytes(void)
+{
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc))
+        return (size_t)pmc.WorkingSetSize;
+    return 0;
+#elif defined(__APPLE__)
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
+        return (size_t)info.resident_size;
+    return 0;
+#else
+    FILE *fp = fopen("/proc/self/statm", "r");
+    if (!fp) return 0;
+    long pages = 0, resident = 0;
+    int matched = fscanf(fp, "%ld %ld", &pages, &resident);
+    fclose(fp);
+    if (matched != 2 || resident < 0) return 0;
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    return (size_t)resident * (size_t)page_size;
+#endif
+}
+
+size_t xb_peak_rss_bytes(void)
+{
+#if defined(_WIN32) || defined(__APPLE__)
+    return xb_rss_bytes();
+#else
+    FILE *fp = fopen("/proc/self/status", "r");
+    if (!fp) return 0;
+    char line[256];
+    size_t kb = 0;
+    while (fgets(line, sizeof line, fp)) {
+        if (strncmp(line, "VmHWM:", 6) == 0) {
+            kb = (size_t)strtoul(line + 6, NULL, 10);
+            break;
+        }
+    }
+    fclose(fp);
+    return kb * 1024;
+#endif
 }
 
 char *xb_strndup(const char *s, size_t n)

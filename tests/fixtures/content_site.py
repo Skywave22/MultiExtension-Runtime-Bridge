@@ -219,9 +219,11 @@ def free_port() -> int:
 
 
 if __name__ == "__main__":
+    # Standalone mode prints the base URL on the first line so a test harness
+    # (the Node smoke test) can start it and read the port back.
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8777
     srv = Server(port)
-    print(f"fixture site on {srv.base}", flush=True)
+    print(f"{srv.base}", flush=True)
     srv.thread.start()
     try:
         while True:

@@ -1,0 +1,1 @@
+{"id":"sora","label":"Sora","manager_id":"sora","engine":"js","artifact_kinds":[".js",".json"],"identify_markers":["SoraExtension;module.exports"],"capabilities":["anime","manga","video","search","popular","latest","detail","prefs"],"platforms":["android","ios","windows","macos","linux"],"notes":"Sora modules exporting an extension object with a fixed method set."}

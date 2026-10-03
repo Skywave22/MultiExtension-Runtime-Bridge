@@ -1,0 +1,1 @@
+{"id":"ireader","label":"iReader","manager_id":"ireader","engine":"jvm","extension_class":"ireader.source.Source","artifact_kinds":[".apk",".jar"],"identify_markers":["ireader;AndroidManifest.xml"],"capabilities":["novel","search","popular","latest","detail","prefs","filters"],"platforms":["android","ios","windows","macos","linux"],"notes":"iReader novel sources."}

@@ -52,7 +52,7 @@ is actually loaded:
 
 | File | Responsibility | Notes |
 |---|---|---|
-| `core/src/server.c` | accept loop, frame codec, 16 MiB ceiling, task pool, one writer lock per connection, deadline propagation, `CANCEL` | A streaming request is terminated only by `STREAM_END`/`STREAM_ERR`, so a truncated stream can never be mistaken for a complete one. |
+| `core/src/server.c` | accept loop, frame codec, 16 MiB ceiling, task pool, one writer lock per connection, per-connection task registry, deadline propagation, `CANCEL` | A streaming request is terminated only by `STREAM_END`/`STREAM_ERR`, so a truncated stream can never be mistaken for a complete one. |
 | `core/src/bridge.c` | the unified method surface, source-id routing, cache key construction, single-flight coalescing, metrics, log ring, format registry access | Handlers are registered with metadata (engine, streamable, cacheable, summary) so routing is data, not a switch. `bridge.methods` introspects this. |
 | `core/src/engine.c` | worker supervision: spawn, `HELLO` handshake over stdio, job queue, per-job deadlines, chunk forwarding, restart with backoff, health | An engine that cannot start is reported, not fatal. |
 | `core/src/rule_engine.c` | Legado book-source interpreter: URL templating (`{{key}}`, `{{page}}`), field rules (`selector@attr`, `@text`, `@html`, `##regex`), search/detail/toc/content builders | This is why Legado needs no JavaScript runtime: 90 % of real book sources are declarative. |
@@ -104,10 +104,19 @@ host ──REQUEST{id,method,params,deadline_ms,cache}──▶ server.c
                               cache store ◀── server.c ──▶ RESPONSE / STREAM_*
 ```
 
-Cancellation is checked at the boundaries the daemon owns (before dispatch,
-between chunks, on engine reads); a worker that ignores it is killed at the end
-of its deadline, which is why the deadline lives on the daemon rather than in
-the client's timer.
+Cancellation is a path of its own, not a best effort. Every in-flight request is
+registered in a per-connection table under the id the client chose, and the
+daemon mints a unique engine job id for it. `CANCEL {"id":"a1"}` marks that task
+and cancels the engine job by its generated id, so two connections can both use
+`"a1"` without interfering, and a late `CANCEL` for a finished request is a
+no-op. A worker-hosted job ends the moment the cancel reaches the daemon; a
+handler the daemon runs in-process (the rule engine) cannot be interrupted
+mid-call, so it answers `-32002` when it returns instead of pretending the work
+never happened.
+
+Deadlines are absolute monotonic instants inside the daemon (`ctx.deadline_ms`)
+and are turned into "time left" only where a job is handed to an engine, so a
+request can never inherit another request's clock — or have its own ignored.
 
 ## Testing strategy
 
@@ -126,7 +135,8 @@ The suites are layered so a failure points at one layer:
 4. `sdk/*/test` — each client library, from its own ergonomics (spawn,
    context manager, retry) through a full read.
 
-`make check` runs all four. `make asan` runs the C suites under
+`make check` runs the C suites, the js-engine suite and the Node SDK suite.
+`make asan` runs the C suites under
 AddressSanitizer + UndefinedBehaviorSanitizer, and the harness fails the run on
 any leaked byte.
 

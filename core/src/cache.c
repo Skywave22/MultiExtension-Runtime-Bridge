@@ -27,6 +27,7 @@ typedef struct flight {
     bool    done;
     char   *value;
     char   *error;
+    int     error_code;
     int     refs;
     struct flight *next;
 } flight_t;
@@ -220,6 +221,7 @@ xb_flight_role xb_flight_begin(xb_cache *c, const char *key, int64_t wait_ms,
     f->key = xb_strdup(key);
     f->done = false;
     f->value = f->error = NULL;
+    f->error_code = 0;
     f->refs = 1;
     f->next = b->flights;
     b->flights = f;
@@ -231,7 +233,7 @@ xb_flight_role xb_flight_begin(xb_cache *c, const char *key, int64_t wait_ms,
 }
 
 void xb_flight_finish(xb_cache *c, xb_flight *handle, const char *value,
-                      const char *error)
+                      const char *error, int error_code)
 {
     if (!c || !handle) return;
     size_t bi = bucket_of(handle->f->key);
@@ -239,19 +241,22 @@ void xb_flight_finish(xb_cache *c, xb_flight *handle, const char *value,
     flight_t *f = handle->f;
     f->value = value ? xb_strdup(value) : NULL;
     f->error = error ? xb_strdup(error) : NULL;
+    f->error_code = value ? 0 : error_code;
     f->done = true;
     XB_COND_BROADCAST(&c->cv);
     XB_MUTEX_UNLOCK(&c->m);
     (void)bi;
 }
 
-int xb_flight_result(xb_flight *h, char **out_value, char **out_error)
+int xb_flight_result(xb_flight *h, char **out_value, char **out_error,
+                     int *out_code)
 {
     if (!h || !h->f) return -1;
     flight_t *f = h->f;
     if (!f->done) return -1;
     if (f->value) { if (out_value) *out_value = xb_strdup(f->value); return 1; }
     if (out_error) *out_error = f->error ? xb_strdup(f->error) : NULL;
+    if (out_code) *out_code = f->error_code;
     return 0;
 }
 

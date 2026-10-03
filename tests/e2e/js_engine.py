@@ -28,7 +28,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(ROOT, "sdk", "python"))
 
-from xbridge import Bridge, BridgeError  # noqa: E402
+from xbridge import (  # noqa: E402
+    REQUEST, RESPONSE, STREAM_CHUNK, STREAM_END, STREAM_ERR,
+    Bridge, BridgeError,
+)
 
 PASSED = 0
 FAILED = 0
@@ -49,6 +52,7 @@ module.exports = {
     return { list: hits, has_next: false, page: page || 1, total: hits.length };
   },
   async getDetail(media) {
+    if (media && media.slow) await new Promise((r) => setTimeout(r, 1200));
     return {
       ...media,
       name: 'Solo Leveling',
@@ -62,6 +66,14 @@ module.exports = {
     };
   },
   async *getVideoListStream(episode) {
+    if (episode && episode.slow) {
+      /* One item every 25 ms, long enough to be cancelled or to time out. */
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 25));
+        yield { url: 'https://cdn.example.tld/part-' + i + '.mp4', quality: 'part-' + i };
+      }
+      return;
+    }
     yield { url: 'https://cdn.example.tld/720.mp4', quality: '720p' };
     yield { url: 'https://cdn.example.tld/1080.mp4', quality: '1080p' };
   },
@@ -84,6 +96,47 @@ def check(cond, msg):
 
 def eq(actual, expected, msg):
     check(actual == expected, f"{msg} (got {actual!r}, want {expected!r})")
+
+
+def raw_request(bridge, method, params, **extra):
+    """Send a REQUEST frame and return the RESPONSE payload.
+
+    The SDK hides the request id; cancellation and deadlines are wire-level
+    contracts, so these tests speak the protocol directly."""
+    rid = bridge.next_id("raw")
+    payload = {"id": rid, "method": method, "params": params}
+    payload.update(extra)
+    bridge._send_frame(REQUEST, payload)
+    while True:
+        frame = bridge.read_frame()
+        if frame.type == RESPONSE:
+            return frame.payload
+
+
+def raw_stream_cancel(bridge, method, params, cancel_after=1):
+    """Start a stream, cancel it after N chunks, report what happened.
+
+    Returns (terminal_kind, terminal_payload, chunks_seen, seconds_from_cancel).
+    """
+    rid = bridge.next_id("rawc")
+    bridge._send_frame(REQUEST, {"id": rid, "method": method, "params": params,
+                                 "stream": True})
+    seen = 0
+    cancelled_at = None
+    t0 = time.time()
+    while time.time() - t0 < 15:
+        frame = bridge.read_frame()
+        if frame.payload.get("id") != rid:
+            continue                      # a stale frame from an earlier test
+        if frame.type == STREAM_CHUNK:
+            seen += 1
+            if seen == cancel_after and cancelled_at is None:
+                bridge.cancel(rid)
+                cancelled_at = time.time()
+        elif frame.type in (STREAM_END, STREAM_ERR):
+            took = (time.time() - cancelled_at) if cancelled_at else 0.0
+            return frame.type, frame.payload, seen, took
+    return None, {}, seen, 0.0
 
 
 def wait_for_socket(path, timeout=15.0):
@@ -179,6 +232,94 @@ def main():
 
         streamed = list(bridge.stream("source.search", {"source_id": src, "query": ""}))
         check(any(c.get("summary") for c in streamed), "one-shot results are chunked with a summary")
+
+        STEP["name"] = "cancelling a running stream"
+        print("\ncancelling a running stream")
+        kind, payload, seen, took = raw_stream_cancel(
+            bridge, "source.getVideoListStream",
+            {"source_id": src, "episode": {"url": "x", "slow": True}})
+        eq(kind, STREAM_ERR, "a cancelled stream ends with STREAM_ERR, not a clean end")
+        eq((payload.get("error") or {}).get("code"), -32002, "cancel reported as -32002")
+        check(took < 1.0, f"cancel took effect promptly ({took * 1000:.0f} ms)")
+        check(seen <= 3, f"production stopped early ({seen} chunks before the terminal frame)")
+
+        # A cancel for an id that is not in flight must be a no-op.
+        bridge.cancel("no-such-request")
+        check(bridge.ping() < 1000, "daemon healthy after cancelling an unknown id")
+
+        # Cancelling a plain (non-streaming) call terminates it with -32002.
+        rid = bridge.next_id("rawns")
+        bridge._send_frame(REQUEST, {
+            "id": rid, "method": "source.getDetail",
+            "params": {"source_id": src, "media": {"url": "x", "slow": True}}})
+        time.sleep(0.15)
+        t0 = time.time()
+        bridge.cancel(rid)
+        resp = None
+        while time.time() - t0 < 10:
+            frame = bridge.read_frame()
+            if frame.type == RESPONSE and frame.payload.get("id") == rid:
+                resp = frame.payload
+                break
+        waited = time.time() - t0
+        check(resp is not None, "a cancelled call still gets exactly one RESPONSE")
+        if resp is not None:
+            eq((resp.get("error") or {}).get("code"), -32002, "non-stream cancel -> -32002")
+        check(waited < 1.0, f"non-stream cancel took effect promptly ({waited * 1000:.0f} ms)")
+
+        STEP["name"] = "deadlines"
+        print("\ndeadlines")
+        t0 = time.time()
+        resp = raw_request(bridge, "source.getDetail",
+                           {"source_id": src, "media": {"url": "deadline", "slow": True}},
+                           deadline_ms=250)
+        elapsed = time.time() - t0
+        check(resp.get("ok") is False, "a call past its deadline is not reported as ok")
+        eq((resp.get("error") or {}).get("code"), -32001, "deadline -> -32001")
+        check(elapsed < 0.9, f"deadline fired on time ({elapsed * 1000:.0f} ms, work takes 1200 ms)")
+
+        t0 = time.time()
+        try:
+            list(bridge.stream("source.getVideoListStream",
+                               {"source_id": src, "episode": {"url": "x", "slow": True}},
+                               timeout_ms=250))
+            check(False, "a slow stream must not outlive its deadline")
+        except (BridgeError, TimeoutError) as e:
+            eq(getattr(e, "code", -32001), -32001, "stream deadline -> -32001")
+        elapsed = time.time() - t0
+        check(elapsed < 0.9, f"stream deadline fired on time ({elapsed * 1000:.0f} ms)")
+
+        check(bridge.ping() < 1000, "daemon healthy after a deadline")
+        found = bridge.search(src, "solo")
+        eq(found["total"], 1, "the worker still serves requests after cancel and deadlines")
+
+        STEP["name"] = "coalescing"
+        print("\ncoalescing")
+        # Two byte-identical calls collapse into one engine job. Cancelling that
+        # job must end both with the same error code, not a generic -32000.
+        params = {"source_id": src, "media": {"url": "coalesce", "slow": True}}
+        rid_a = bridge.next_id("coalesce")
+        bridge._send_frame(REQUEST, {"id": rid_a, "method": "source.getDetail",
+                                     "params": params})
+        time.sleep(0.1)
+        rid_b = bridge.next_id("coalesce")
+        bridge._send_frame(REQUEST, {"id": rid_b, "method": "source.getDetail",
+                                     "params": params})
+        time.sleep(0.1)
+        bridge.cancel(rid_a)
+        answers = {}
+        t0 = time.time()
+        while len(answers) < 2 and time.time() - t0 < 10:
+            frame = bridge.read_frame()
+            if frame.type == RESPONSE and frame.payload.get("id") in (rid_a, rid_b):
+                answers[frame.payload["id"]] = frame.payload
+        eq(len(answers), 2, "both coalesced calls answered")
+        for rid in (rid_a, rid_b):
+            payload = answers.get(rid) or {}
+            eq((payload.get("error") or {}).get("code"), -32002,
+               f"coalesced call {rid} reports the owner's cancel")
+        eq((answers.get(rid_b) or {}).get("meta", {}).get("coalesced"), True,
+           "the second call joined the in-flight one")
 
         STEP["name"] = "cancellation and errors"
         print("\ncancellation and errors")

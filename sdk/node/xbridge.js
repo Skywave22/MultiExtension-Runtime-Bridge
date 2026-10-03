@@ -114,13 +114,17 @@ class Bridge {
     this.hello = {};
     this._sock = null;
     this._buf = Buffer.alloc(0);
-    /* One ordered queue of frames, exactly like the Python SDK: a response is
-     * matched by id as it is read, and a frame that belongs to another call is
-     * held aside until that call is reached. One in-flight call per connection;
-     * open a second connection for concurrency, which is what the load tests
-     * do and what the connection-per-purpose model expects. */
+    /* Frames are routed by request id, not by arrival order. The daemon answers
+     * pipelined requests in completion order, and a long stream must not delay
+     * an unrelated ping, so every in-flight request owns a bucket that holds
+     * frames until its caller asks for them. The bucket is released when the
+     * request's terminal frame (RESPONSE / STREAM_END / STREAM_ERR) is handed
+     * over; anything that arrives after that is dropped, which is exactly the
+     * tail of a cancelled stream. `_frames`/`_frameWaiters` carry id-less
+     * frames (HELLO_ACK, protocol errors). */
     this._frames = [];
     this._frameWaiters = [];
+    this._requests = new Map();
     this._counter = 0;
     this._closed = false;
     this._proc = null;
@@ -187,7 +191,7 @@ class Bridge {
       this._buf = Buffer.concat([this._buf, buf]);
       this._drainFrames();
     });
-    this._sock.on('error', (err) => this._failAll(err));
+    this._sock.on('error', (err) => { this._closed = true; this._failAll(err); });
     this._sock.on('close', () => {
       this._closed = true;
       this._failAll(new BridgeError(ERR.UNAVAILABLE, 'connection closed by daemon'));
@@ -217,9 +221,30 @@ class Bridge {
       this._writeFrame(FT.PONG, frame.payload);
       return;
     }
+    const id = frame.payload ? frame.payload.id : undefined;
+    if (id !== undefined) {
+      const req = this._requests.get(id);
+      if (!req) return;                  // stale or cancelled: suppress
+      if (req.waiter) {
+        const waiter = req.waiter;
+        req.waiter = null;
+        waiter.resolve(frame);
+      } else if (req.frames.length < 1024) {
+        req.frames.push(frame);
+      }
+      return;
+    }
     const waiter = this._frameWaiters.shift();
     if (waiter) waiter.resolve(frame);
     else this._frames.push(frame);
+  }
+
+  /** Does this frame finish the request `id`? */
+  _isTerminal(frame, id) {
+    if (frame.type === FT.ERROR) return true;
+    if (!frame.payload || frame.payload.id !== id) return false;
+    return frame.type === FT.RESPONSE || frame.type === FT.STREAM_END ||
+           frame.type === FT.STREAM_ERR;
   }
 
   _nextFrame() {
@@ -228,23 +253,41 @@ class Bridge {
     return new Promise((resolve, reject) => this._frameWaiters.push({ resolve, reject }));
   }
 
-  /** Read frames until one belongs to `id`, holding the others aside. */
+  /** The next frame for `id`, waiting for it if it has not arrived yet.
+   *
+   * The bucket lives as long as the request does: a stream suspends between
+   * chunks, so frames that arrived while it was suspended must still be here
+   * when it resumes. */
   async _nextFrameFor(id) {
-    const skipped = [];
+    let req = this._requests.get(id);
+    if (!req) {
+      req = { frames: [], waiter: null };
+      this._requests.set(id, req);
+    }
     try {
       for (;;) {
-        const frame = await this._nextFrame();
-        const fid = frame.payload ? frame.payload.id : undefined;
-        if (fid === undefined || fid === id) return frame;
-        skipped.push(frame);
+        const frame = req.frames.length
+          ? req.frames.shift()
+          : await new Promise((resolve, reject) => { req.waiter = { resolve, reject }; });
+        if (frame === undefined) continue;
+        if (this._isTerminal(frame, id)) this._requests.delete(id);
+        return frame;
       }
-    } finally {
-      if (skipped.length) this._frames.unshift(...skipped);
+    } catch (err) {
+      this._requests.delete(id);
+      throw err;
     }
   }
 
   _failAll(err) {
     for (const { reject } of this._frameWaiters.splice(0)) reject(err);
+    for (const req of this._requests.values()) {
+      if (req.waiter) {
+        const waiter = req.waiter;
+        req.waiter = null;
+        waiter.reject(err);
+      }
+    }
   }
 
   _writeFrame(type, payload) {

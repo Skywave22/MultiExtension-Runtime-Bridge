@@ -26,6 +26,7 @@
 #  include <arpa/inet.h>
 #  include <unistd.h>
 #  include <fcntl.h>
+#  include <poll.h>
 #  include <pwd.h>
 #  include <sys/stat.h>
 #  define XB_CLOSESOCK close
@@ -332,18 +333,49 @@ xb_sock_t xb_listener_accept(xb_listener *l)
         }
     }
 #endif
+#ifdef _WIN32
     for (;;) {
         xb_sock_t c = accept(l->fd, NULL, NULL);
         if (c != XB_SOCK_INVALID) return c;
         int e = xb_sock_last_error();
-#ifdef _WIN32
         if (e == WSAEINTR) continue;
-#else
-        if (e == EINTR) continue;
-#endif
         if (l->stop) return XB_SOCK_INVALID;
         return XB_SOCK_INVALID;
     }
+#else
+    /* Wait for a client, but never indefinitely. xb_listener_wake() unblocks
+     * accept() by connecting to our own endpoint, and that connection is not
+     * guaranteed to arrive: the connect can fail, or a successor daemon can
+     * accept it after a socket-file swap. A bounded poll means the accept
+     * thread always notices `stop`, so shutdown cannot hang. */
+    for (;;) {
+        struct pollfd pfd;
+        pfd.fd = l->fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, 200);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return XB_SOCK_INVALID;
+        }
+        if (pr == 0) {
+            if (l->stop) return XB_SOCK_INVALID;
+            continue;
+        }
+        xb_sock_t c = accept(l->fd, NULL, NULL);
+        if (c != XB_SOCK_INVALID) {
+            if (l->stop) {
+                /* This is the connection that woke us, not a real client. */
+                xb_sock_close(c);
+                return XB_SOCK_INVALID;
+            }
+            return c;
+        }
+        if (xb_sock_last_error() == EINTR) continue;
+        if (l->stop) return XB_SOCK_INVALID;
+        return XB_SOCK_INVALID;
+    }
+#endif
 }
 
 /* Ask a blocked accept() to return. Implemented by making one throwaway
@@ -591,8 +623,13 @@ int xb_sock_set_recv_timeout(xb_sock_t s, int ms)
 int xb_wakeup_pair(xb_sock_t out[2])
 {
 #ifndef _WIN32
+    /* A socket pair, not a pipe: both ends stay pollable/selectable with the
+     * same helpers as every other socket, and out[0] is the end you write to,
+     * exactly like the Windows branch below (a pipe pair used to hand back the
+     * read end first, so xb_wakeup_signal() wrote into the read end and the
+     * signal never arrived). */
     int fds[2];
-    if (pipe(fds) != 0) return -1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) return -1;
     out[0] = fds[0];
     out[1] = fds[1];
     return 0;

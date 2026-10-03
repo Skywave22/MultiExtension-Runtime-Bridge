@@ -55,7 +55,7 @@ Every message on a byte stream is:
 | `0x05` | `STREAM_CHUNK` | daemon | see §5 |
 | `0x06` | `STREAM_END` | daemon | see §5 |
 | `0x07` | `STREAM_ERR` | daemon | see §5 |
-| `0x08` | `CANCEL` | both | `{"id":"a1"}` |
+| `0x08` | `CANCEL` | both | `{"id":"a1"}` — cancels the in-flight request with that id **on this connection**; the request ends with `-32002` |
 | `0x09` | `PING` | both | `{}` (or opaque echo token) |
 | `0x0A` | `PONG` | both | echo of the PING payload |
 | `0x0B` | `ERROR` | daemon | protocol-level error, not tied to a request: `{"code":-32700,"message":"bad frame"}` |
@@ -84,7 +84,9 @@ Every message on a byte stream is:
 * `cache.key` — optional explicit key; when omitted the key is
   `sha256(method ‖ canonical(params))`, where canonical JSON sorts object keys.
 * `coalesce` — when `true` (default) and a *cacheable, byte-identical* request is already
-  in flight, the daemon attaches this request to it and both receive the same response.
+  in flight, the daemon attaches this request to it and both receive the same response —
+  including a failure: if the shared call is cancelled or times out, every waiter is
+  answered with the owner's error code, not a generic engine error.
 * `stream` — when `true` the reply is a stream (§5); `RESPONSE` will never be sent.
 
 Unknown fields are ignored. Unknown `method` → `RESPONSE{ok:false, error.code:-32601}`.
@@ -143,8 +145,12 @@ terminal frame (`STREAM_END` or `STREAM_ERR`).
 * The daemon applies backpressure: it stops reading from the engine when the connection's
   output buffer exceeds `high_water` (default 4 MiB) and resumes below `low_water` (1 MiB).
 * `STREAM_ERR`: `{"id":"s7","error":{"code":-32005,"message":"…"}}`.
-* A host `CANCEL` for a stream id stops production and suppresses everything after the first
-  frame already in flight.
+* A host `CANCEL` for a stream id stops production, ends the stream with
+  `STREAM_ERR{code:-32002}`, and suppresses every frame after it — including frames the
+  extension had already produced, which are dropped rather than delivered late.
+* `CANCEL` names an id scoped to the connection that sent it: two clients may both use
+  `"a1"`, and a `CANCEL` for an id that has already finished (or never existed) is a
+  no-op, never an error.
 
 ## 6. Handshake
 

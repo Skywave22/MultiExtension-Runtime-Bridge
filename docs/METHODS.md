@@ -110,6 +110,18 @@ One error table on every transport (`bridge/server.h`, mirrored in every SDK):
 | `-32006` | artifact rejected (malformed extension) | no |
 | `-32007` | limit exceeded (frame/target size) | no |
 
+### Deadlines and cancellation
+
+* `deadline_ms` on a request is **relative to receipt** and belongs to the daemon;
+  the client does not need a timer. A call that misses it is answered `-32001`, and
+  the engine job is cancelled so the extension stops working on it.
+* `CANCEL {"id": …}` cancels the request with that id on the connection that sent it.
+  A cancelled call is answered `-32002`; a cancelled stream ends with
+  `STREAM_ERR{code:-32002}` and no further chunks. Cancelling an id that already
+  finished is a no-op.
+* Coalesced calls share one engine job, so a cancel or timeout on the shared call
+  ends every waiter with the same code.
+
 ## `format.*`
 
 | Method | Params | Returns |

@@ -39,14 +39,18 @@ typedef struct xb_flight xb_flight;
 xb_flight_role xb_flight_begin(xb_cache *c, const char *key, int64_t wait_ms,
                                xb_flight **out);
 
-/* Owner publishes the outcome (value may be NULL for errors) and wakes waiters. */
+/* Owner publishes the outcome (value may be NULL for errors) and wakes waiters.
+ * `error_code` travels with the message so a waiter can report exactly why the
+ * shared call failed (-32001, -32002, -32003...) instead of a generic engine
+ * error. 0 means "no stronger code than the default". */
 void xb_flight_finish(xb_cache *c, xb_flight *f, const char *value,
-                      const char *error);
+                      const char *error, int error_code);
 
 /* Waiter reads the result of the completed flight. Returns 1 if a value exists
  * (malloc'd copy into *out_value), 0 if the flight failed (error copied into
- * *out_error), -1 if the flight is still running. */
-int xb_flight_result(xb_flight *f, char **out_value, char **out_error);
+ * *out_error, code into *out_code), -1 if the flight is still running. */
+int xb_flight_result(xb_flight *f, char **out_value, char **out_error,
+                     int *out_code);
 
 void xb_flight_release(xb_flight *f);
 

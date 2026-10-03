@@ -127,7 +127,8 @@ static XB_THREAD_FN(waiter_thread)
     xb_flight_role role = xb_flight_begin(fc->cache, "shared-key", 5000, &f);
     if (role == XB_FLIGHT_WAITER && f) {
         char *value = NULL, *err = NULL;
-        int r = xb_flight_result(f, &value, &err);
+        int code = 0;
+        int r = xb_flight_result(f, &value, &err, &code);
         if (r == 1 && value && strcmp(value, "{\"answer\":42}") == 0) {
             XB_MUTEX_LOCK(&fc->m);
             fc->waiters_done++;
@@ -139,6 +140,32 @@ static XB_THREAD_FN(waiter_thread)
     }
     (void)role;
     XB_THREAD_RETURN(0);
+}
+
+/* A waiter must learn *why* the shared call failed: the code is what a host
+ * shows the user, and a generic engine error is a lie when the real reason was
+ * a cancel or a deadline. */
+XB_TEST(single_flight_propagates_the_owners_error_code)
+{
+    xb_cache *c = xb_cache_new(64, 1024 * 1024, 60000);
+
+    xb_flight *owner = NULL;
+    XB_CHECK(xb_flight_begin(c, "failing-key", 5000, &owner) == XB_FLIGHT_OWNER);
+    xb_flight_finish(c, owner, NULL, "cancelled", -32002);
+
+    xb_flight *waiter = NULL;
+    XB_CHECK(xb_flight_begin(c, "failing-key", 5000, &waiter) == XB_FLIGHT_WAITER);
+    char *value = NULL, *err = NULL;
+    int code = 0;
+    XB_CHECK_EQ_INT(xb_flight_result(waiter, &value, &err, &code), 0);
+    XB_CHECK_EQ_INT(code, -32002);
+    XB_CHECK_EQ_STR(err, "cancelled");
+    XB_CHECK(value == NULL);
+    xb_free(value);
+    xb_free(err);
+    xb_flight_release(waiter);
+    xb_flight_release(owner);
+    xb_cache_free(c);
 }
 
 XB_TEST(single_flight_coalesces_concurrent_callers)
@@ -158,7 +185,7 @@ XB_TEST(single_flight_coalesces_concurrent_callers)
     }
     xb_sleep_ms(60);   /* let the waiters block inside xb_flight_begin */
 
-    xb_flight_finish(c, owner, "{\"answer\":42}", NULL);
+    xb_flight_finish(c, owner, "{\"answer\":42}", NULL, 0);
     xb_flight_release(owner);
     xb_sleep_ms(150);
 

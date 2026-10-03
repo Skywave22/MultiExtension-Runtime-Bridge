@@ -4,7 +4,7 @@
 #   make test       build and run the unit + protocol suite
 #   make e2e        run the end-to-end test (real daemon, real HTTP site)
 #   make js-test    run the js-engine test (real daemon + Node worker)
-#   make check      test + e2e
+#   make check      test + e2e + js + node + python suites
 #   make bench      build and run the benchmark
 #   make formats    regenerate the JSON mirror of the format table
 #   make asan       build with AddressSanitizer+UBSan and run tests
@@ -106,7 +106,7 @@ node-test: all
 python-test: all
 	python3 sdk/python/test_smoke.py
 
-check: all test e2e js-test node-test
+check: all test e2e js-test node-test python-test
 
 -include $(CORE_OBJ:.o=.d)
 -include $(TEST_OBJ:.o=.d)

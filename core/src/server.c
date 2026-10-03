@@ -51,8 +51,10 @@ typedef struct task {
     char        *request_json;   /* owned copy of the frame payload */
     char         id[68];
     char         method[96];
-    int64_t      deadline_ms;
+    char         job_id[40];     /* daemon-generated engine job correlation id */
+    int64_t      deadline_ms;    /* relative to receipt, as sent by the client */
     bool         stream;
+    volatile bool cancelled;     /* set by a CANCEL frame on this connection */
     struct task *next;
 } task_t;
 
@@ -66,6 +68,11 @@ typedef struct conn {
     bool        closing;       /* reader loop finished; no new tasks accepted */
     bool        hello_done;
     uint64_t    id_counter;    /* last id seen, for duplicate detection */
+    /* In-flight tasks, so a CANCEL frame can name one by its client id. The
+     * table is per connection: two clients may both use the id "r1". */
+    xb_mutex_t  tlock;
+    task_t     *tasks[64];
+    size_t      task_n;
     char        peer[128];
     struct conn *next;
 } conn_t;
@@ -181,16 +188,80 @@ static void conn_inflight_done(conn_t *c)
     XB_MUTEX_UNLOCK(&c->lock);
 }
 
+/* ---------------------------------------------------------- task registry - */
+
+/* Engine job ids are generated here, never by the engine, so a CANCEL frame
+ * names exactly the job a request started even when two connections happen to
+ * use the same client-side id. */
+static uint64_t TASK_SEQ;
+
+static void next_task_job_id(char *out, size_t cap)
+{
+    uint64_t n = xb_atomic_add64(&TASK_SEQ, 1);
+    snprintf(out, cap, "xbp-%016llx", (unsigned long long)n);
+}
+
+static void conn_task_track(conn_t *c, task_t *t, bool add)
+{
+    XB_MUTEX_LOCK(&c->tlock);
+    if (add) {
+        for (size_t i = 0; i < XB_ARRAY_LEN(c->tasks); i++) {
+            if (!c->tasks[i]) { c->tasks[i] = t; c->task_n++; break; }
+        }
+    } else {
+        for (size_t i = 0; i < XB_ARRAY_LEN(c->tasks); i++) {
+            if (c->tasks[i] == t) {
+                c->tasks[i] = NULL;
+                if (c->task_n) c->task_n--;
+                break;
+            }
+        }
+    }
+    XB_MUTEX_UNLOCK(&c->tlock);
+}
+
+/* Mark a task cancelled and copy out the engine job to cancel. Removal and
+ * this lookup both hold tlock, and a task is freed only after removal, so the
+ * pointer cannot go stale underneath us. */
+static void conn_task_cancel(conn_t *c, const char *id, char *job_id, size_t cap)
+{
+    job_id[0] = '\0';
+    XB_MUTEX_LOCK(&c->tlock);
+    for (size_t i = 0; i < XB_ARRAY_LEN(c->tasks); i++) {
+        task_t *t = c->tasks[i];
+        if (t && xb_streq(t->id, id)) {
+            t->cancelled = true;
+            xb_str_lcpy(job_id, t->job_id, cap);
+            break;
+        }
+    }
+    XB_MUTEX_UNLOCK(&c->tlock);
+}
+
+/* Every exit path of run_task() funnels through here, exactly once. */
+static void task_finish(task_t *t)
+{
+    conn_t *c = t->conn;
+    conn_task_track(c, t, false);
+    free(t->request_json);
+    free(t);
+    conn_inflight_done(c);
+}
+
 /* Emit callback handed to method handlers for streaming methods. */
 typedef struct {
     conn_t *conn;
     const char *id;
     int64_t seq;
+    volatile bool *cancelled;
 } emit_ctx;
 
 static bool stream_emit(void *ud, int64_t seq, const xb_json *chunk)
 {
     emit_ctx *e = (emit_ctx *)ud;
+    /* A cancelled stream stops producing immediately: the terminal frame has
+     * already been queued, and returning false asks the engine to stop too. */
+    if (e->cancelled && *e->cancelled) return false;
     xb_jsonw w;
     xb_jw_init(&w);
     xb_jw_obj_begin(&w);
@@ -290,9 +361,7 @@ static void run_task(task_t *t)
         xb_jw_free(&w);
         send_response(c, t->id, XB_ERR_PARSE, NULL, t0, NULL, false, false);
         xb_arena_destroy(&arena);
-        free(t->request_json);
-        free(t);
-        conn_inflight_done(c);
+        task_finish(t);
         return;
     }
 
@@ -330,9 +399,7 @@ static void run_task(task_t *t)
             xb_jw_free(&w);
             xb_free(cached);
             xb_arena_destroy(&arena);
-            free(t->request_json);
-            free(t);
-            conn_inflight_done(c);
+            task_finish(t);
             return;
         }
     }
@@ -346,7 +413,8 @@ static void run_task(task_t *t)
                                               &flight);
         if (role == XB_FLIGHT_WAITER) {
             char *value = NULL, *errmsg = NULL;
-            int rr = xb_flight_result(flight, &value, &errmsg);
+            int code = 0;
+            int rr = xb_flight_result(flight, &value, &errmsg, &code);
             if (rr == 1 && value) {
                 xb_jsonw w;
                 xb_jw_init(&w);
@@ -354,15 +422,15 @@ static void run_task(task_t *t)
                 send_response(c, t->id, 0, &w, t0, NULL, false, true);
                 xb_jw_free(&w);
             } else {
-                send_response(c, t->id, XB_ERR_ENGINE, NULL, t0, NULL, false, true);
+                /* Report why the shared call failed, not just that it did. */
+                send_response(c, t->id, code ? code : XB_ERR_ENGINE,
+                              NULL, t0, NULL, false, true);
             }
             xb_free(value);
             xb_free(errmsg);
             xb_flight_release(flight);
             xb_arena_destroy(&arena);
-            free(t->request_json);
-            free(t);
-            conn_inflight_done(c);
+            task_finish(t);
             return;
         }
         i_am_owner = (role == XB_FLIGHT_OWNER);
@@ -376,8 +444,8 @@ static void run_task(task_t *t)
     ec.conn = c;
     ec.id = t->id;
     ec.seq = 0;
+    ec.cancelled = &t->cancelled;
 
-    volatile bool cancelled = false;
     xb_ctx ctx;
     memset(&ctx, 0, sizeof ctx);
     ctx.bridge = c->bridge;
@@ -385,18 +453,23 @@ static void run_task(task_t *t)
     ctx.method = t->method;
     ctx.params = params;
     ctx.request = req;
-    ctx.deadline_ms = t->deadline_ms;
+    /* Handlers see an absolute deadline; the wire format is relative. */
+    ctx.deadline_ms = t->deadline_ms > 0 ? xb_mono_ms() + t->deadline_ms : 0;
     ctx.out = &out;
     ctx.stream = stream;
     ctx.emit = stream_emit;
     ctx.emit_ud = &ec;
-    ctx.cancelled = &cancelled;
+    ctx.cancelled = &t->cancelled;
+    xb_str_lcpy(ctx.job_id, t->job_id, sizeof ctx.job_id);
 
     xb_handler_fn fn = xb_lookup_method(t->method);
     int rc;
     const char *engine_name = NULL;
     if (!fn) {
         rc = XB_ERR_NO_METHOD;
+    } else if (t->cancelled) {
+        /* Cancelled while it sat in the pool: do not start work at all. */
+        rc = XB_ERR_CANCELLED;
     } else {
         xb_method_meta meta;
         xb_lookup_method_meta(t->method, &meta);
@@ -407,6 +480,10 @@ static void run_task(task_t *t)
             rc = fn(&ctx);
         }
     }
+
+    /* An in-process engine cannot be interrupted mid-call, so a cancel that
+     * arrived while it ran is reported now instead of silently answering. */
+    if (rc == 0 && t->cancelled) rc = XB_ERR_CANCELLED;
 
     if (stream) {
         /* A streaming request never gets a RESPONSE frame; it is terminated by
@@ -441,20 +518,19 @@ static void run_task(task_t *t)
         if (rc == 0 && key[0] && flight) {
             /* Publish for waiters and store in the cache while the value is hot. */
             char *text = (char *)(out.buf.data ? out.buf.data : (const uint8_t *)"null");
-            if (i_am_owner) xb_flight_finish(xb_bridge_cache(c->bridge), flight, text, NULL);
+            if (i_am_owner)
+                xb_flight_finish(xb_bridge_cache(c->bridge), flight, text, NULL, 0);
             xb_cache_put(xb_bridge_cache(c->bridge), key, text, req_ttl);
         } else if (key[0] && flight && i_am_owner) {
             xb_flight_finish(xb_bridge_cache(c->bridge), flight, NULL,
-                             xb_error_message(rc));
+                             xb_error_message(rc), rc);
         }
     }
 
     if (flight) xb_flight_release(flight);
     xb_jw_free(&out);
     xb_arena_destroy(&arena);
-    free(t->request_json);
-    free(t);
-    conn_inflight_done(c);
+    task_finish(t);
 }
 
 static XB_THREAD_FN(pool_worker)
@@ -547,20 +623,24 @@ static void handle_request_frame(conn_t *c, const char *payload, size_t len)
     xb_str_lcpy(t->method, method, sizeof t->method);
     t->deadline_ms = xb_json_obj_int(j, "deadline_ms", 0);
     t->stream = xb_json_obj_bool(j, "stream", false);
+    next_task_job_id(t->job_id, sizeof t->job_id);
 
     XB_MUTEX_LOCK(&c->lock);
     c->inflight++;
     XB_MUTEX_UNLOCK(&c->lock);
 
+    /* Track before submitting: a CANCEL can arrive while the task is running. */
+    conn_task_track(c, t, true);
+
     if (!pool_submit(t)) {
-        free(t->request_json);
-        free(t);
-        conn_inflight_done(c);
+        task_finish(t);
         send_protocol_error(c, XB_ERR_UNAVAILABLE, "server is shutting down");
     }
     xb_arena_destroy(&arena);
 }
 
+/* CANCEL names a request id on *this* connection. Unknown ids are a no-op:
+ * the request already finished, or it never existed. */
 static void handle_cancel_frame(conn_t *c, const char *payload, size_t len)
 {
     xb_arena arena;
@@ -568,7 +648,11 @@ static void handle_cancel_frame(conn_t *c, const char *payload, size_t len)
     size_t off = 0;
     xb_json *j = xb_json_parse(&arena, payload, len, &off);
     const char *id = j ? xb_json_obj_str(j, "id", NULL) : NULL;
-    if (id) xb_bridge_cancel(c->bridge, id);
+    if (id && id[0]) {
+        char job_id[40];
+        conn_task_cancel(c, id, job_id, sizeof job_id);
+        if (job_id[0]) xb_bridge_cancel(c->bridge, job_id);
+    }
     xb_arena_destroy(&arena);
 }
 
@@ -685,6 +769,7 @@ done:
     conns_track(c, false);
     XB_MUTEX_DESTROY(&c->wlock);
     XB_MUTEX_DESTROY(&c->lock);
+    XB_MUTEX_DESTROY(&c->tlock);
     XB_COND_DESTROY(&c->cv);
     xb_free(c);
     XB_THREAD_RETURN(0);
@@ -716,6 +801,7 @@ static XB_THREAD_FN(accept_loop)
         c->fd = fd;
         XB_MUTEX_INIT(&c->wlock);
         XB_MUTEX_INIT(&c->lock);
+        XB_MUTEX_INIT(&c->tlock);
         XB_COND_INIT(&c->cv);
         xb_sock_set_nodelay(fd);
         xb_bridge_connection_added(RS.bridge, c);

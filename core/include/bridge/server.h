@@ -89,7 +89,11 @@ typedef struct xb_ctx {
     const char  *method;
     const xb_json *params;
     const xb_json *request;     /* whole request object */
-    int64_t      deadline_ms;
+    int64_t      deadline_ms;   /* absolute monotonic ms; 0 = none */
+    /* Daemon-generated id for the engine job behind this request. The server
+     * puts it there so a CANCEL frame can map a client request id onto the
+     * engine job without either side knowing engine internals. */
+    char         job_id[40];
     xb_jsonw    *out;           /* result object writer */
     /* streaming — same shape as xb_chunk_fn so handlers can hand it straight
      * to an engine without an adapter. */

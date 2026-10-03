@@ -651,7 +651,13 @@ int xb_engine_submit(xb_engine *e, const xb_job *job, xb_job_result *res)
     }
 
     pending_t *p = (pending_t *)xb_alloc(sizeof *p);
-    next_job_id(e, p->id, sizeof p->id);
+    if (job->job_id[0] && !pending_find(w, job->job_id)) {
+        /* Caller-supplied correlation id, used by the daemon so a client
+         * CANCEL can name the job directly. */
+        xb_str_lcpy(p->id, job->job_id, sizeof p->id);
+    } else {
+        next_job_id(e, p->id, sizeof p->id);
+    }
     p->stream = job->stream;
     p->on_chunk = job->on_chunk;
     p->chunk_ud = job->on_chunk_ud;

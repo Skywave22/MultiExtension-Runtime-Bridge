@@ -33,6 +33,12 @@ typedef struct {
     xb_chunk_fn  on_chunk;
     void        *on_chunk_ud;
     char         source_id[128];  /* optional routing hint (JS executor etc.) */
+    /* Optional caller-chosen correlation id (<= 39 bytes). When set, the engine
+     * uses it as the pending-job id, which is what lets a caller cancel a job
+     * it submitted (`xb_engine_cancel`) without knowing daemon-internal ids.
+     * Ids must be unique per worker; a duplicate falls back to a generated
+     * one so a late response can never be misrouted. */
+    char         job_id[40];
 } xb_job;
 
 typedef struct {

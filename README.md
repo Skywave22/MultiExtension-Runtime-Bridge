@@ -38,7 +38,7 @@ Xbridge is a ~180 KB native binary that binds a socket and answers in
 | Handshake | grep stderr for a string | real `HELLO`/`HELLO_ACK` with capabilities |
 | Request round-trip | Java heap, JSON over stdin/stdout | **0.079 ms** p50, 0.13 ms p99 |
 | Streaming | `status:'partial'` chunks dropped by the host | `STREAM_CHUNK`/`STREAM_END`, client-controlled |
-| Cancellation | client-side `TimeoutException`, then a best-effort cancel | daemon-side deadlines + `CANCEL` frames |
+| Cancellation | client-side `TimeoutException`, then a best-effort cancel | daemon-side deadlines, `CANCEL` per request id, `-32002` propagation |
 | Repeat reads | one fetch per call | L1 cache + single-flight coalescing (**6×** on a warm read) |
 | Resident memory | 128 MiB minimum heap | **1.0 MiB** |
 
@@ -123,30 +123,30 @@ Every claim in this README is enforced by a test that runs on `make check`:
 
 | Suite | What it proves | Result on this tree |
 |---|---|---|
-| `tests/unit` | JSON, HTML, cache, hashing, ABI contracts | 70 tests, 2 686 checks |
-| `tests/protocol` | framing, pipelining, concurrency, hostile clients | included above |
+| `tests/unit` | JSON, HTML, cache, single-flight, hashing, sockets, ABI | 80 tests, 2 784 checks |
+| `tests/protocol` | framing, pipelining, concurrency, cancellation, hostile clients | included above |
 | `tests/e2e` | install → search → detail → chapter over real HTTP | 84/84 checks |
-| `tests/e2e/js_engine.py` | a **second engine**: Node worker hosting a source | 24/24 checks |
+| `tests/e2e/js_engine.py` | a **second engine**: Node worker hosting a source, deadlines, cancel | 43/43 checks |
 | `sdk/python/test_smoke.py` | the Python client, from spawn to retry | 17/17 checks |
-| `sdk/node/test/smoke.js` | the Node client, same journey | 27/27 checks |
+| `sdk/node/test/smoke.js` | the Node client, same journey + frame routing | 36/36 checks |
 
 ```sh
 $ make test
-70 tests, 2686 checks, 0 failures
+80 tests, 2784 checks, 0 failures
 PASS (no leaks)
 
 $ make asan          # AddressSanitizer + UndefinedBehaviorSanitizer
-70 tests, 2686 checks, 0 failures
+80 tests, 2784 checks, 0 failures
 PASS (no leaks)
 
 $ make e2e
 e2e: 84/84 checks passed, 0 failed
 
 $ make js-test       # a real Node worker hosting a real source
-js engine: 24 passed, 0 failed
+js engine: 43 passed, 0 failed
 
 $ make node-test && make python-test
-node sdk: 27 passed, 0 failed
+node sdk: 36 passed, 0 failed
 python sdk: 17 passed, 0 failed
 ```
 
@@ -157,8 +157,15 @@ commit log: a vanished client could kill the daemon with `SIGPIPE`; every
 thread was spawned detached so shutdown raced with in-flight work; the HTML
 selector parser dropped `.class`/`[attr]` suffixes after a tag name; URL joins
 produced double slashes; the Python client unlinked the daemon's socket when a
-plain client closed; and a restarting daemon would delete its successor's
-socket. Each has a regression test now.
+plain client closed; a restarting daemon would delete its successor's socket;
+`deadline_ms` was treated as absolute on one path and relative on another, so
+client deadlines were never really enforced; `CANCEL` frames could not match
+the engine job they named, so cancellation only looked implemented; the
+shutdown wake-up connection could be lost and leave the daemon hanging in
+`accept()`; a coalesced waiter was told `-32000` whatever the real reason was;
+the Node client could deadlock when responses arrived out of order; and the
+POSIX wake-up pair handed back the read end first, so it never signalled. Each
+has a regression test now.
 
 ## Platforms
 

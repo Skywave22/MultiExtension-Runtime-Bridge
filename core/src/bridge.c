@@ -1057,6 +1057,10 @@ int xb_handler_source_family(xb_ctx *ctx)
     const char *method = ctx->method;
     const xb_json *params = ctx->params;
 
+    /* A request cancelled while it waited for a task slot must not start work
+     * it can no longer deliver. */
+    if (ctx->cancelled && *ctx->cancelled) return XB_ERR_CANCELLED;
+
     const char *source_id = xb_json_obj_str(params, "source_id", NULL);
     if (!source_id) {
         xb_jw_key(ctx->out, "error");
@@ -1201,11 +1205,13 @@ int xb_handler_source_family(xb_ctx *ctx)
     memset(&job, 0, sizeof job);
     job.method = method;
     job.params = merged_params;
-    job.deadline_ms = ctx->deadline_ms;
+    /* ctx->deadline_ms is absolute; the engine wants time remaining. */
+    job.deadline_ms = ctx->deadline_ms ? ctx->deadline_ms - xb_mono_ms() : 0;
     job.stream = ctx->stream;
     job.on_chunk = ctx->emit;
     job.on_chunk_ud = ctx->emit_ud;
     xb_str_lcpy(job.source_id, x->id, sizeof job.source_id);
+    xb_str_lcpy(job.job_id, ctx->job_id, sizeof job.job_id);
 
     if (!merged_params) {
         XB_WARN("could not re-parse merged params for %.60s (offset %zu)",
@@ -1361,6 +1367,8 @@ static xb_engine *pick_engine(xb_bridge *b, const xb_json *params)
 
 static int forward_to_engine(xb_ctx *ctx, const char *method)
 {
+    if (ctx->cancelled && *ctx->cancelled) return XB_ERR_CANCELLED;
+
     xb_engine *e = pick_engine(ctx->bridge, ctx->params);
     if (!e) {
         xb_jw_obj_begin(ctx->out);
@@ -1376,6 +1384,7 @@ static int forward_to_engine(xb_ctx *ctx, const char *method)
     job.method = method;
     job.params = ctx->params;
     job.deadline_ms = ctx->deadline_ms ? ctx->deadline_ms - xb_mono_ms() : 0;
+    xb_str_lcpy(job.job_id, ctx->job_id, sizeof job.job_id);
     xb_job_result jr;
     int rc = xb_engine_submit(e, &job, &jr);
     if (rc != 0) {

@@ -421,6 +421,37 @@ XB_TEST(daemon_survives_a_connection_that_vanishes_mid_request)
     client_close(&d);
 }
 
+/* CANCEL names a request id on the connection that sent it. Everything that
+ * does not name a live task must be a no-op, and the connection must stay
+ * usable afterwards. */
+XB_TEST(cancel_frames_are_scoped_and_never_break_a_connection)
+{
+    client c = {.sock = XB_SOCK_INVALID, .id = 0};
+    XB_CHECK(client_open(&c) == 0);
+    char ack[4096];
+    client_handshake(&c, ack, sizeof ack);
+    char buf[4096];
+
+    /* A request that already finished: the task is gone from the registry. */
+    XB_CHECK(frame_send_str(&c, FT_REQUEST,
+                            "{\"id\":\"done\",\"method\":\"bridge.ping\"}") == 0);
+    XB_CHECK(frame_recv_until(&c, FT_RESPONSE, buf, sizeof buf) == FT_RESPONSE);
+    XB_CHECK(frame_send_str(&c, FT_CANCEL, "{\"id\":\"done\"}") == 0);
+
+    /* Unknown, empty and unparseable payloads. */
+    XB_CHECK(frame_send_str(&c, FT_CANCEL, "{\"id\":\"never-sent\"}") == 0);
+    XB_CHECK(frame_send_str(&c, FT_CANCEL, "{}") == 0);
+    XB_CHECK(frame_send_str(&c, FT_CANCEL, "not json at all") == 0);
+
+    /* A cancelled id is released, so it can be reused by a later request. */
+    XB_CHECK(frame_send_str(&c, FT_REQUEST,
+                            "{\"id\":\"done\",\"method\":\"bridge.ping\"}") == 0);
+    XB_CHECK(frame_recv_until(&c, FT_RESPONSE, buf, sizeof buf) == FT_RESPONSE);
+    XB_CHECK(strstr(buf, "\"id\":\"done\"") != NULL);
+    XB_CHECK(strstr(buf, "\"pong\"") != NULL);
+    client_close(&c);
+}
+
 XB_TEST(shutdown_stops_the_daemon)
 {
     server_stop();

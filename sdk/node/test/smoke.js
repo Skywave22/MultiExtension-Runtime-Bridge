@@ -15,7 +15,7 @@ const fs = require('fs');
 const os = require('os');
 const { spawn } = require('child_process');
 
-const { Bridge, BridgeError } = require('../xbridge');
+const { Bridge, BridgeError, FT } = require('../xbridge');
 
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 const DAEMON = path.join(ROOT, 'build', 'xbridged');
@@ -52,11 +52,83 @@ function startFixtureSite() {
   });
 }
 
+/* -- frame routing (client-side, no daemon) -------------------------------- */
+
+/** A Bridge whose socket is a stub, so frames can be injected by hand. */
+function fakeBridge() {
+  const b = new Bridge('fake://', 1000);
+  b._sock = { write: () => true, end() {}, destroy() {} };
+  b._closed = false;
+  return b;
+}
+
+/** Ids of the requests currently awaiting a frame, oldest first. */
+function pendingIds(b) {
+  return [...b._requests.keys()];
+}
+
+async function frameRouting() {
+  console.log('\nframe routing (client-side, no daemon)');
+
+  /* The daemon answers pipelined requests in completion order. */
+  {
+    const b = fakeBridge();
+    const first = b.call('x.one');
+    const second = b.call('x.two');
+    const [id1, id2] = pendingIds(b);
+    b._deliver({ type: FT.RESPONSE, payload: { id: id2, ok: true, result: 'two' } });
+    b._deliver({ type: FT.RESPONSE, payload: { id: id1, ok: true, result: 'one' } });
+    eq(await first, 'one', 'out-of-order response routed to the first call');
+    eq(await second, 'two', 'out-of-order response routed to the second call');
+  }
+
+  /* A stream in flight must not swallow a concurrent call's response. */
+  {
+    const b = fakeBridge();
+    const it = b.stream('x.stream')[Symbol.asyncIterator]();
+    const pending = it.next();
+    const streamId = pendingIds(b)[0];
+    const ping = b.call('x.ping');
+    const pingId = pendingIds(b).find((id) => id !== streamId);
+    b._deliver({ type: FT.STREAM_CHUNK, payload: { id: streamId, seq: 0, chunk: { n: 1 } } });
+    b._deliver({ type: FT.RESPONSE, payload: { id: pingId, ok: true, result: 'pong' } });
+    b._deliver({ type: FT.STREAM_CHUNK, payload: { id: streamId, seq: 1, chunk: { n: 2 } } });
+    b._deliver({ type: FT.STREAM_END, payload: { id: streamId, done: true, count: 2 } });
+    eq((await pending).value.n, 1, 'first stream chunk delivered');
+    eq(await ping, 'pong', 'a call behind a stream still resolves');
+    eq((await it.next()).value.n, 2, 'second stream chunk delivered in order');
+    eq((await it.next()).done, true, 'stream ends');
+  }
+
+  /* After a cancel the daemon suppresses the rest of the stream: any late
+   * frame must be dropped, not handed to the next call. */
+  {
+    const b = fakeBridge();
+    const it = b.stream('x.stream')[Symbol.asyncIterator]();
+    const pending = it.next();
+    const streamId = pendingIds(b)[0];
+    b._deliver({ type: FT.STREAM_CHUNK, payload: { id: streamId, seq: 0, chunk: { n: 1 } } });
+    eq((await pending).value.n, 1, 'chunk delivered before the cancel');
+    b.cancel(streamId);
+    b._deliver({ type: FT.STREAM_ERR, payload: { id: streamId, error: { code: -32002, message: 'cancelled' } } });
+    let code = 0;
+    try { await it.next(); } catch (err) { code = err.code; }
+    eq(code, -32002, 'cancelled stream reports -32002');
+    b._deliver({ type: FT.STREAM_CHUNK, payload: { id: streamId, seq: 1, chunk: { n: 2 } } });
+    const after = b.call('x.after');
+    const afterId = pendingIds(b)[0];
+    b._deliver({ type: FT.RESPONSE, payload: { id: afterId, ok: true, result: 'ok' } });
+    eq(await after, 'ok', 'late frames for a cancelled stream are dropped');
+  }
+}
+
 async function main() {
   if (!fs.existsSync(DAEMON)) {
     console.error(`daemon not found: ${DAEMON} (run \`make\` first)`);
     process.exit(2);
   }
+
+  await frameRouting();
 
   const site = await startFixtureSite();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbridge-node-'));
